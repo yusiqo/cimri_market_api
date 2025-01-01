@@ -5,8 +5,6 @@ class CimriScraper {
     private $headers = [
         'accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'accept-language: tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
-        'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'sec-ch-ua: "Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
         'sec-ch-ua-mobile: ?0',
         'sec-ch-ua-platform: "Windows"',
         'sec-fetch-dest: document',
@@ -17,6 +15,13 @@ class CimriScraper {
         'cache-control: max-age=0'
     ];
     private $totalPages = 1;
+    private $cacheDir;
+    private $cacheDuration = 3600; // 1 saat
+    private $maxRetries = 3; // Maksimum deneme sayısı
+    private $retryDelay = 2; // Denemeler arası bekleme süresi (saniye)
+    private $maxCacheFiles = 500; // Maksimum cache dosya sayısı
+    private $minDelay = 1000000; // 1 saniye (mikrosaniye)
+    private $maxDelay = 3000000; // 3 saniye (mikrosaniye)
 
     private $turkishChars = [
         'ş' => 's', 'Ş' => 'S',
@@ -26,6 +31,74 @@ class CimriScraper {
         'ö' => 'o', 'Ö' => 'O',
         'ç' => 'c', 'Ç' => 'C'
     ];
+
+    public function __construct() {
+        require_once __DIR__ . '/UserAgents.php';
+
+        $this->cacheDir = dirname(__DIR__) . '/cache';
+        if (!is_dir($this->cacheDir)) {
+            mkdir($this->cacheDir, 0777, true);
+        }
+
+        // Her başlangıçta eski cache'leri temizle
+        $this->cleanOldCache();
+    }
+
+    private function randomDelay() {
+        usleep(rand($this->minDelay, $this->maxDelay));
+    }
+
+    private function cleanOldCache() {
+        $files = glob($this->cacheDir . '/*.json');
+        $totalFiles = count($files);
+
+        if ($totalFiles > $this->maxCacheFiles) {
+            // Dosyaları son değiştirilme tarihine göre sırala
+            usort($files, function($a, $b) {
+                return filemtime($b) - filemtime($a);
+            });
+
+            // En eski dosyaları sil
+            $filesToDelete = array_slice($files, $this->maxCacheFiles);
+            foreach ($filesToDelete as $file) {
+                unlink($file);
+                error_log("Cache dosyası silindi (limit aşımı): " . basename($file));
+            }
+        }
+
+        // Süresi geçmiş dosyaları da sil
+        $now = time();
+        foreach ($files as $file) {
+            if ($now - filemtime($file) > $this->cacheDuration) {
+                unlink($file);
+            }
+        }
+    }
+
+    private function getCacheKey($url) {
+        return $this->cacheDir . '/' . md5($url) . '.json';
+    }
+
+    private function getCache($url) {
+        $cacheFile = $this->getCacheKey($url);
+        if (file_exists($cacheFile)) {
+            $cacheTime = filemtime($cacheFile);
+            if (time() - $cacheTime < $this->cacheDuration) {
+                return json_decode(file_get_contents($cacheFile), true);
+            }
+            // Süresi geçmiş cache dosyasını sil
+            unlink($cacheFile);
+        }
+        return null;
+    }
+
+    private function setCache($url, $data) {
+        // Cache limitini kontrol et ve gerekirse temizle
+        $this->cleanOldCache();
+
+        $cacheFile = $this->getCacheKey($url);
+        file_put_contents($cacheFile, json_encode($data));
+    }
 
     private function convertTurkishChars($text) {
         return str_replace(
@@ -95,30 +168,107 @@ class CimriScraper {
     }
 
     private function fetchUrl($url) {
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HTTPHEADER => $this->headers,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_ENCODING => '',
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-        ]);
-
-        $response = curl_exec($ch);
-
-        if (curl_errno($ch)) {
-            throw new Exception('Curl hatası: ' . curl_error($ch));
+        // Önbellekten kontrol et
+        $cachedData = $this->getCache($url);
+        if ($cachedData !== null) {
+            return $cachedData['content'];
         }
 
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        if ($httpCode !== 200) {
-            throw new Exception("HTTP Hata Kodu: " . $httpCode);
+        $lastError = null;
+        $attempt = 0;
+
+        while ($attempt < $this->maxRetries) {
+            try {
+                $attempt++;
+
+                // İlk denemede ve sonraki denemelerde rastgele bekle
+                if ($attempt === 1) {
+                    $this->randomDelay();
+                } else {
+                    error_log("Deneme {$attempt}/{$this->maxRetries} - URL: {$url}");
+                    sleep($this->retryDelay);
+                }
+
+                // Rastgele bir user agent seç
+                $userAgent = UserAgents::getRandom();
+
+                // User agent'a göre sec-ch-ua header'ını güncelle
+                $secChUa = '';
+                if (strpos($userAgent, 'Chrome') !== false) {
+                    preg_match('/Chrome\/(\d+)/', $userAgent, $matches);
+                    $version = $matches[1] ?? '120';
+                    $secChUa = '"Google Chrome";v="' . $version . '", "Chromium";v="' . $version . '", "Not_A Brand";v="24"';
+                } elseif (strpos($userAgent, 'Firefox') !== false) {
+                    $secChUa = '"Firefox";v="121", "Not_A Brand";v="24"';
+                } elseif (strpos($userAgent, 'Edge') !== false) {
+                    $secChUa = '"Edge";v="120", "Not_A Brand";v="24"';
+                } elseif (strpos($userAgent, 'Safari') !== false && strpos($userAgent, 'Chrome') === false) {
+                    $secChUa = '"Safari";v="17", "Not_A Brand";v="24"';
+                }
+
+                // Headers'ı güncelle
+                $headers = $this->headers;
+                if ($secChUa) {
+                    $headers[] = 'sec-ch-ua: ' . $secChUa;
+                }
+
+                $ch = curl_init();
+                curl_setopt_array($ch, [
+                    CURLOPT_URL => $url,
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_HTTPHEADER => $headers,
+                    CURLOPT_FOLLOWLOCATION => true,
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_ENCODING => '',
+                    CURLOPT_USERAGENT => $userAgent,
+                    CURLOPT_TIMEOUT => 30 // 30 saniye timeout
+                ]);
+
+                $response = curl_exec($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+                // CURL hatası kontrolü
+                if (curl_errno($ch)) {
+                    throw new Exception('Curl hatası: ' . curl_error($ch));
+                }
+
+                curl_close($ch);
+
+                // HTTP durum kodu kontrolü
+                if ($httpCode === 429) { // Too Many Requests
+                    throw new Exception("Rate limit aşıldı (HTTP 429)");
+                } elseif ($httpCode !== 200) {
+                    throw new Exception("HTTP Hata Kodu: " . $httpCode);
+                }
+
+                // Başarılı yanıt, önbelleğe kaydet ve dön
+                $this->setCache($url, [
+                    'content' => $response,
+                    'timestamp' => time()
+                ]);
+
+                return $response;
+
+            } catch (Exception $e) {
+                $lastError = $e;
+                error_log("Hata (Deneme {$attempt}/{$this->maxRetries}): " . $e->getMessage());
+
+                // Son denemede başarısız olursa hatayı fırlat
+                if ($attempt === $this->maxRetries) {
+                    throw new Exception("Maksimum deneme sayısına ulaşıldı ({$this->maxRetries}). Son hata: " . $e->getMessage());
+                }
+
+                // Rate limit hatası varsa daha uzun bekle
+                if (strpos($e->getMessage(), 'Rate limit') !== false) {
+                    $waitTime = $this->retryDelay * 2;
+                    error_log("Rate limit aşıldı. {$waitTime} saniye bekleniyor...");
+                    sleep($waitTime);
+                }
+            }
         }
 
-        curl_close($ch);
-        return $response;
+        // Bu noktaya ulaşılmaması gerekir ama yine de hata fırlatalım
+        throw $lastError ?: new Exception("Bilinmeyen bir hata oluştu");
     }
 
     public function getTotalPages() {
