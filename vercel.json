@@ -2,6 +2,25 @@
   "functions": {
     "api.php": {
       "runtime": "vercel-php@0.5.2"
+    },
+    "docs.php": {
+      "runtime": "vercel-php@0.5.2"
+    },
+    "image.php": {
+      "runtime": "vercel-php@0.5.2"
+    },
+    "logo.php": {
+      "runtime": "vercel-php@0.5.2"
+    },
+    "product.php": {
+      "runtime": "vercel-php@0.5.2"
     }
-  }
+  },
+  "routes": [
+    { "src": "/api", "dest": "/api.php" },
+    { "src": "/docs", "dest": "/docs.php" },
+    { "src": "/image", "dest": "/image.php" },
+    { "src": "/logo", "dest": "/logo.php" },
+    { "src": "/product", "dest": "/product.php" }
+  ]
 }
